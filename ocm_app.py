@@ -3,9 +3,11 @@
 OCM Schedule API Wrapper (Flask)
 --------------------------------
 Fetches Primary and Standby (Secondary) schedules from OCM.
+
 Supports:
   - Full year view (default)
   - Today-only view with ?todayOnly=true
+  - Specific date with ?date=YYYYMMDD
 """
 
 from flask import Flask, request, jsonify
@@ -18,12 +20,13 @@ import urllib.parse
 app = Flask(__name__)
 
 def fetch_schedule(group_name, username, password):
-    """Helper function to call OCM and return simplified list"""
+    """Helper to call OCM and return simplified list"""
     encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
     today = datetime.datetime.utcnow()
     end = today + datetime.timedelta(days=365)
     start_str = today.strftime("%Y%m%d")
     end_str = end.strftime("%Y%m%d")
+
     subscription_id = username.split("/")[0]
     encoded_group = urllib.parse.quote(group_name)
     url = (
@@ -44,7 +47,6 @@ def fetch_schedule(group_name, username, password):
         print(f"❌ Error fetching {group_name}: {e}")
         return []
 
-    # Handle response
     if not isinstance(raw, list) or len(raw) == 0 or "schedulingDetails" not in raw[0]:
         print(f"⚠️ Unexpected structure for {group_name}")
         return []
@@ -69,7 +71,9 @@ def fetch_schedule(group_name, username, password):
                 "Timezone": tz
             })
 
-    print(f"✅ {group_name}: {len(output)} records")
+    print(f"✅ {group_name}: {len(output)} records fetched")
+    if len(output) > 0:
+        print(f"🧩 Sample record: {output[0]}")
     return output
 
 
@@ -81,8 +85,9 @@ def get_schedule():
       "group": "OMS-DBA-SEV1"
     }
 
-    Optional query parameter:
-      ?todayOnly=true   → returns only today's Primary & Standby
+    Optional query params:
+      ?todayOnly=true  → today's schedule
+      ?date=YYYYMMDD   → schedule for a specific date
     """
     data = request.get_json(force=True)
     base_group = data.get("group")
@@ -94,15 +99,15 @@ def get_schedule():
     if not username or not password:
         return jsonify({"error": "OCM_USERNAME or OCM_PASSWORD not set"}), 400
 
-    # Check if todayOnly is requested
     today_only = request.args.get("todayOnly", "false").lower() == "true"
+    specific_date = request.args.get("date")
     today_str = datetime.datetime.utcnow().strftime("%Y%m%d")
 
-    # Build full group names
+    print(f"📥 Query params → todayOnly={today_only}, date={specific_date}")
+
     primary_group = f"{base_group}-Primary"
     secondary_group = f"{base_group}-Secondary"
 
-    # Fetch both
     primary_data = fetch_schedule(primary_group, username, password)
     standby_data = fetch_schedule(secondary_group, username, password)
 
@@ -114,12 +119,24 @@ def get_schedule():
     for p in primary_data:
         p["Role"] = "Primary"
 
-    # Filter for today if requested
+    # Apply filters
     if today_only:
         print(f"📅 Filtering to today's date: {today_str}")
-        primary_data = [p for p in primary_data if p["Date"] == today_str]
-        standby_data = [s for s in standby_data if s["Date"] == today_str]
+        primary_data = [p for p in primary_data if str(p["Date"]) == today_str]
+        standby_data = [s for s in standby_data if str(s["Date"]) == today_str]
 
+    elif specific_date:
+        print(f"📅 Filtering to specific date: {specific_date}")
+        primary_data = [p for p in primary_data if str(p["Date"]) == str(specific_date)]
+        standby_data = [s for s in standby_data if str(s["Date"]) == str(specific_date)]
+
+        # If multiple matches, only keep the first record for each role
+        if len(primary_data) > 1:
+            primary_data = [primary_data[0]]
+        if len(standby_data) > 1:
+            standby_data = [standby_data[0]]
+
+    # Default full-year if no filter
     result = {
         "Primary": primary_data,
         "Standby": standby_data
