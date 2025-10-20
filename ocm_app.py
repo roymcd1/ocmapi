@@ -1,151 +1,72 @@
-#!/usr/bin/env python3
-"""
-OCM Schedule API Wrapper (Flask)
---------------------------------
-Fetches Primary and Standby (Secondary) schedules from OCM.
-
-Supports:
-  - Full year view (default)
-  - Today-only view with ?todayOnly=true
-  - Specific date with ?date=YYYYMMDD
-"""
-
 from flask import Flask, request, jsonify
-import requests
-import os
-import base64
-import datetime
-import urllib.parse
+import requests, re, datetime
 
+# Flask app entrypoint (used by Code Engine)
 app = Flask(__name__)
 
-def fetch_schedule(group_name, username, password):
-    """Helper to call OCM and return simplified list"""
-    encoded = base64.b64encode(f"{username}:{password}".encode()).decode()
-    today = datetime.datetime.utcnow()
-    end = today + datetime.timedelta(days=365)
-    start_str = today.strftime("%Y%m%d")
-    end_str = end.strftime("%Y%m%d")
-
-    subscription_id = username.split("/")[0]
-    encoded_group = urllib.parse.quote(group_name)
-    url = (
-        f"https://oncallmanager.ibm.com/api/ocdm/v1/{subscription_id}/crosssubscriptionschedules"
-        f"?groupname={encoded_group}&from={start_str}&to={end_str}"
-    )
-
-    headers = {"Accept": "application/json", "Authorization": f"Basic {encoded}"}
-
-    print(f"\n📤 Fetching OCM group: {group_name}")
-    print(f"URL: {url}")
-
-    try:
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
-        raw = r.json()
-    except Exception as e:
-        print(f"❌ Error fetching {group_name}: {e}")
-        return []
-
-    if not isinstance(raw, list) or len(raw) == 0 or "schedulingDetails" not in raw[0]:
-        print(f"⚠️ Unexpected structure for {group_name}")
-        return []
-
-    schedule_details = raw[0]["schedulingDetails"]
-    output = []
-
-    for entry in schedule_details:
-        group_id = entry.get("GroupId", group_name)
-        tz = entry.get("Timezone", "Etc/GMT")
-        for shift in entry.get("Shifts", []):
-            users = shift.get("UserDetails", [])
-            primary_name = users[0].get("FullName") if len(users) > 0 else None
-            secondary_name = users[1].get("FullName") if len(users) > 1 else None
-            output.append({
-                "Date": shift.get("Date"),
-                "GroupId": group_id,
-                "Primary": primary_name,
-                "Secondary": secondary_name,
-                "StartTime": shift.get("StartTime"),
-                "EndTime": shift.get("EndTime"),
-                "Timezone": tz
-            })
-
-    print(f"✅ {group_name}: {len(output)} records fetched")
-    if len(output) > 0:
-        print(f"🧩 Sample record: {output[0]}")
-    return output
-
-
-@app.route("/getSchedule", methods=["POST"])
-def get_schedule():
-    """
-    Input JSON example:
-    {
-      "group": "OMS-DBA-SEV1"
-    }
-
-    Optional query params:
-      ?todayOnly=true  → today's schedule
-      ?date=YYYYMMDD   → schedule for a specific date
-    """
+@app.route("/check-document", methods=["POST"])
+def check_document():
+    """Return Primary + Standby on-call schedule for today or a specific date."""
     data = request.get_json(force=True)
-    base_group = data.get("group")
-    if not base_group:
+    group = data.get("group")
+    if not group:
         return jsonify({"error": "Missing 'group' parameter"}), 400
 
-    username = os.getenv("OCM_USERNAME")
-    password = os.getenv("OCM_PASSWORD")
-    if not username or not password:
-        return jsonify({"error": "OCM_USERNAME or OCM_PASSWORD not set"}), 400
+    # --- Query parameter handling ---
+    date_str = request.args.get("date")
+    today_flag = request.args.get("todayOnly", "").lower()
 
-    today_only = request.args.get("todayOnly", "false").lower() == "true"
-    specific_date = request.args.get("date")
-    today_str = datetime.datetime.utcnow().strftime("%Y%m%d")
+    if date_str:
+        if not re.fullmatch(r"^\d{8}$", date_str):
+            return jsonify({"error": "Invalid date format. Use YYYYMMDD."}), 400
+        if today_flag == "true":
+            return jsonify({"error": "Provide either 'todayOnly' or 'date', not both."}), 400
+    else:
+        # Default to today's UTC date
+        date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
+        today_flag = "true"
 
-    print(f"📥 Query params → todayOnly={today_only}, date={specific_date}")
+    # --- Build API call ---
+    ocm_url = "https://ocm-api-call.203sr19ngo3o.us-south.codeengine.appdomain.cloud/getSchedule"
+    query_params = {"todayOnly": "true"} if today_flag == "true" else {"date": date_str}
+    payload = {"group": group}
 
-    primary_group = f"{base_group}-Primary"
-    secondary_group = f"{base_group}-Secondary"
+    try:
+        resp = requests.post(ocm_url, params=query_params, json=payload, timeout=30)
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Failed to reach OCM API: {str(e)}"}), 502
 
-    primary_data = fetch_schedule(primary_group, username, password)
-    standby_data = fetch_schedule(secondary_group, username, password)
+    result = resp.json()
 
-    # Adjust standby records
-    for s in standby_data:
-        s["Standby"] = s.pop("Primary")
-        s["Role"] = "Standby"
+    # --- Local filter by Date field ---
+    result["Primary"] = [e for e in result.get("Primary", []) if e.get("Date") == date_str]
+    result["Standby"] = [e for e in result.get("Standby", []) if e.get("Date") == date_str]
 
-    for p in primary_data:
-        p["Role"] = "Primary"
+    # --- Merge Primary and Standby ---
+    merged_schedule = []
+    for entry in result.get("Primary", []):
+        merged_schedule.append({
+            "Name": entry.get("Primary"),
+            "Role": "Primary",
+            "Date": entry.get("Date"),
+            "StartTime": entry.get("StartTime"),
+            "EndTime": entry.get("EndTime"),
+            "Timezone": entry.get("Timezone")
+        })
+    for entry in result.get("Standby", []):
+        merged_schedule.append({
+            "Name": entry.get("Standby"),
+            "Role": "Standby",
+            "Date": entry.get("Date"),
+            "StartTime": entry.get("StartTime"),
+            "EndTime": entry.get("EndTime"),
+            "Timezone": entry.get("Timezone")
+        })
 
-    # Apply filters
-    if today_only:
-        print(f"📅 Filtering to today's date: {today_str}")
-        primary_data = [p for p in primary_data if str(p["Date"]) == today_str]
-        standby_data = [s for s in standby_data if str(s["Date"]) == today_str]
-
-    elif specific_date:
-        print(f"📅 Filtering to specific date: {specific_date}")
-        primary_data = [p for p in primary_data if str(p["Date"]) == str(specific_date)]
-        standby_data = [s for s in standby_data if str(s["Date"]) == str(specific_date)]
-
-        # If multiple matches, only keep the first record for each role
-        if len(primary_data) > 1:
-            primary_data = [primary_data[0]]
-        if len(standby_data) > 1:
-            standby_data = [standby_data[0]]
-
-    # Default full-year if no filter
-    result = {
-        "Primary": primary_data,
-        "Standby": standby_data
-    }
-
-    print(f"✅ Combined output: {len(primary_data)} primary, {len(standby_data)} standby")
-    return jsonify(result)
+    return jsonify(merged_schedule), 200
 
 
+# --- For local debugging only ---
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
-
