@@ -53,4 +53,26 @@ def check_document():
         merged_schedule.append({
             "Name": entry.get("Primary"),
             "Role": "Primary",
+            "Date": entry.get("Date"),
+            "StartTime": entry.get("StartTime"),
+            "EndTime": entry.get("EndTime"),
+            "Timezone": entry.get("Timezone")
+        })
+    for entry in result.get("Standby", []):
+        merged_schedule.append({
+            "Name": entry.get("Standby"),
+            "Role": "Standby",
+            "Date": entry.get("Date"),
+            "StartTime": entry.get("StartTime"),
+            "EndTime": entry.get("EndTime"),
+            "Timezone": entry.get("Timezone")
+        })
+
+    return jsonify(merged_schedule), 200
+
+
+# --- App entrypoint (runs on port 8081) ---
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8081))
+    app.run(host="0.0.0.0", port=port, debug=True)
 
