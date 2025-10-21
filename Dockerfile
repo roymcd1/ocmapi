@@ -11,7 +11,7 @@ COPY ocm_app.py .
 RUN pip install --no-cache-dir flask requests
 
 # Expose Flask port
-EXPOSE 5000
+EXPOSE 8080
 
 # Environment variables (overridden by Code Engine secrets)
 ENV PORT=5000
