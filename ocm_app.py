@@ -7,8 +7,8 @@ app = Flask(__name__)
 @app.route("/check-document", methods=["POST"])
 def check_document():
     """
-    Return Primary + Standby on-call schedule for today or a specific date.
-    This version is ready for Code Engine deployment and listens on port 8080.
+    Wrapper API to fetch on-call schedule from the backend OCM API.
+    Returns Primary + Standby for a given date or today.
     """
     data = request.get_json(force=True)
     group = data.get("group")
@@ -30,7 +30,7 @@ def check_document():
         date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
         today_flag = "true"
 
-    # --- Call the OCM API ---
+    # --- Call the real backend OCM API ---
     ocm_url = "https://ocm-api-call.203sr19ngo3o.us-south.codeengine.appdomain.cloud/getSchedule"
     query_params = {"todayOnly": "true"} if today_flag == "true" else {"date": date_str}
     payload = {"group": group}
