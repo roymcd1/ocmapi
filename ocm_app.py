@@ -8,7 +8,7 @@ app = Flask(__name__)
 def check_document():
     """
     Return Primary + Standby on-call schedule for today or a specific date.
-    This version is ready for Code Engine deployment and listens on port 8081.
+    This version is ready for Code Engine deployment and listens on port 8080.
     """
     data = request.get_json(force=True)
     group = data.get("group")
@@ -71,8 +71,8 @@ def check_document():
     return jsonify(merged_schedule), 200
 
 
-# --- App entrypoint (runs on port 8081) ---
+# --- App entrypoint (runs on port 8080) ---
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8081))
+    port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port, debug=True)
 
