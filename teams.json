@@ -1,0 +1,22 @@
+{
+  "OMS-DBA-SEV1": {
+    "env_prefix": "DBA_TEAM",
+    "groups": [
+      "OMS-DBA-SEV1-Primary",
+      "OMS-DBA-SEV1-Secondary"
+    ]
+  },
+  "P2PaaS DataServices On Call level 1": {
+    "env_prefix": "P2PAAS_TEAM",
+    "groups": [
+      "P2PaaS DataServices On Call level 1"
+    ]
+  },
+  "CDS team": {
+    "env_prefix": "CDS_TEAM",
+    "groups": [
+      "CDS DBA 1"
+    ]
+  }
+}
+

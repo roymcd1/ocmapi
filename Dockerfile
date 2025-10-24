@@ -1,14 +1,17 @@
-# Use a small official Python base image
 FROM python:3.11-slim
 
+# Create app directory
 WORKDIR /app
-COPY ocm_app.py .
 
-RUN pip install --no-cache-dir flask requests
+# Copy files
+COPY . /app
 
+# Install dependencies
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Expose port (optional; Code Engine sets it automatically)
 EXPOSE 8080
-ENV PORT=8080
-ENV PYTHONUNBUFFERED=1
 
+# Run the app
 CMD ["python", "ocm_app.py"]
 
