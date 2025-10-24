@@ -13,5 +13,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 EXPOSE 8080
 
 # Run the app
-CMD ["python", "ocm_app.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "ocm_app:app"]
 
