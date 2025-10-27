@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 import datetime, re, os, requests, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dtparse  # pip install python-dateutil
 
 app = Flask(__name__)
@@ -44,30 +45,23 @@ def fetch_window(subscription_id, start_str, end_str, username, password, group_
     """Fetch a wide time window of schedules."""
     url = f"{OCM_API_BASE}/api/ocdm/v1/{subscription_id}/crosssubscriptionschedules"
     params = {"from": start_str, "to": end_str}
+    print(f"[INFO] GET {url} from={start_str} to={end_str} (group_hint={group_hint})")
 
-    print(f"[INFO] GET {url} from={start_str} to={end_str} (no server-side group filter)")
     try:
         resp = requests.get(url, auth=(username, password), params=params, timeout=30)
         if resp.status_code == 200:
-            try:
-                data = resp.json()
-            except Exception:
-                print(f"[WARN] 200 OK but non-JSON body: {resp.text[:200]}")
-                return []
-            if data is None:
-                print("[INFO] OCM returned null (treat as empty)")
+            data = resp.json()
+            if not data:
                 return []
             if isinstance(data, list):
-                print(f"[INFO] OCM returned list with {len(data)} items")
+                print(f"[INFO] OCM returned {len(data)} buckets")
                 return data
-            else:
-                print(f"[WARN] Unexpected payload type: {type(data)}")
-                return []
+            return []
         else:
-            print(f"[WARN] HTTP {resp.status_code}: {resp.text[:200]}")
+            print(f"[WARN] HTTP {resp.status_code}: {resp.text[:150]}")
             return []
     except Exception as e:
-        print(f"[ERROR] OCM API call failed: {e}")
+        print(f"[ERROR] fetch_window failed: {e}")
         return []
 
 
@@ -84,15 +78,14 @@ def normalize_entries(raw_payload):
             date = det.get("Date")
             tz = det.get("Timezone")
             for shift in det.get("Shifts", []):
-                row = {
+                out.append({
                     "GroupId": group_id,
                     "Date": date,
                     "Timezone": tz,
                     "StartTime": shift.get("StartTime"),
                     "EndTime": shift.get("EndTime"),
                     "Users": shift.get("UserDetails", []) or []
-                }
-                out.append(row)
+                })
     return out
 
 
@@ -103,7 +96,7 @@ def overlaps_day(start_iso, end_iso, day_start_utc, day_end_utc):
         end = dtparse.isoparse(end_iso)
         return (start < day_end_utc) and (end > day_start_utc)
     except Exception as e:
-        print(f"[WARN] Failed to parse times: {e} :: {start_iso} / {end_iso}")
+        print(f"[WARN] Failed to parse times: {e}")
         return False
 
 
@@ -122,7 +115,7 @@ def pick_display_users(users):
 
 @app.route("/getSchedule", methods=["POST"])
 def get_schedule():
-    """Main endpoint for fetching on-call schedule."""
+    """Main endpoint for fetching on-call schedule (supports multi-group teams)."""
     data = request.get_json(force=True) or {}
     group = data.get("groupPrefix")
     team_key = data.get("teamKey")
@@ -159,65 +152,60 @@ def get_schedule():
                      "valid_teams": list(TEAMS.keys())}
         }), 500
 
-    if group:
-        resolved_group = group
-    else:
-        groups = team_info.get("groups", [])
-        if group_override and group_override in groups:
-            resolved_group = group_override
-        elif len(groups) == 1:
-            resolved_group = groups[0]
-        else:
-            return jsonify({
-                "error": "Multiple groups configured; specify 'groupOverride'.",
-                "groups": groups
-            }), 400
-
-    print(f"[INFO] getSchedule: group={resolved_group}, date={date_str} (team={team_name})")
-
     username, password, subscription_id = get_team_credentials(team_info)
     if not username or not password:
         return jsonify({"error": "Missing credentials"}), 500
 
-    raw = fetch_window(subscription_id, query_start, query_end, username, password, group_hint=resolved_group)
-    flat = normalize_entries(raw)
+    # Determine groups to query
+    groups_to_query = []
+    if group:
+        groups_to_query = [group]
+    else:
+        groups_to_query = team_info.get("groups", [])
 
-    filtered = []
-    for row in flat:
-        if (row.get("GroupId") == resolved_group and
-            overlaps_day(row.get("StartTime",""), row.get("EndTime",""), day_start, day_end)):
-            filtered.append({
-                "GroupId": row["GroupId"],
-                "Date": date_str,
-                "Timezone": row.get("Timezone"),
-                "StartTime": row.get("StartTime"),
-                "EndTime": row.get("EndTime"),
-                "Users": pick_display_users(row.get("Users", []))
-            })
+    print(f"[INFO] Fetching schedules for groups={groups_to_query}")
 
-    if not filtered:
-        return jsonify({
-            "message": f"No on-call assignments found for {resolved_group} on {date_str}"
-        }), 404
+    results = []
+    with ThreadPoolExecutor(max_workers=len(groups_to_query)) as executor:
+        futures = {
+            executor.submit(fetch_window, subscription_id, query_start, query_end, username, password, grp): grp
+            for grp in groups_to_query
+        }
+        for future in as_completed(futures):
+            grp = futures[future]
+            raw = future.result()
+            flat = normalize_entries(raw)
+            for row in flat:
+                if (row.get("GroupId") == grp and
+                    overlaps_day(row.get("StartTime",""), row.get("EndTime",""), day_start, day_end)):
+                    results.append({
+                        "GroupId": row["GroupId"],
+                        "Date": date_str,
+                        "Timezone": row.get("Timezone"),
+                        "StartTime": row.get("StartTime"),
+                        "EndTime": row.get("EndTime"),
+                        "Users": pick_display_users(row.get("Users", []))
+                    })
 
-    # --- summary builder for Watson Assistant ---
+    if not results:
+        return jsonify({"message": f"No on-call assignments found for {groups_to_query} on {date_str}"}), 404
+
+    # Build summary for Watson
     summary_lines = []
-    for entry in filtered:
+    for entry in results:
         try:
             user = entry["Users"][0]["name"] if entry["Users"] else "Unknown"
             start = entry["StartTime"][11:16] if entry.get("StartTime") else "?"
             end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
-            summary_lines.append(f"• {user} — {start} → {end}")
+            summary_lines.append(f"{entry['GroupId']}: {user} — {start} → {end}")
         except Exception as e:
-            print(f"[WARN] failed to format entry: {e}")
-            continue
+            print(f"[WARN] format fail: {e}")
 
     summary_text = "Here’s who’s on call today:\n\n" + "\n".join(summary_lines)
-    # ------------------------------------------------
 
     return jsonify({
         "status": 200,
-        "body": filtered,
+        "body": results,
         "summary": summary_text
     }), 200
 
