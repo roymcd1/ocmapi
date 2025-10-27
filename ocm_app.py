@@ -144,6 +144,7 @@ def get_schedule():
     query_start = (day_start - datetime.timedelta(days=30)).strftime("%Y%m%d")
     query_end = (day_end + datetime.timedelta(days=30)).strftime("%Y%m%d")
 
+    # 🔹 Resolve the team from config
     team_name, team_info = find_team_entry(group=group, team_key=team_key, env_prefix=env_prefix)
     if not team_info:
         return jsonify({
@@ -156,7 +157,7 @@ def get_schedule():
     if not username or not password:
         return jsonify({"error": "Missing credentials"}), 500
 
-    # Determine groups to query
+    # 🔹 Determine which groups to query
     groups_to_query = []
     if group:
         groups_to_query = [group]
@@ -190,7 +191,7 @@ def get_schedule():
     if not results:
         return jsonify({"message": f"No on-call assignments found for {groups_to_query} on {date_str}"}), 404
 
-    # Build summary for Watson
+    # 🔹 Build summary for Watson Assistant
     summary_lines = []
     for entry in results:
         try:
