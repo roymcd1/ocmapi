@@ -1,9 +1,16 @@
 from flask import Flask, request, jsonify
-import datetime, re, os, requests, json
+import datetime, re, os, requests, json, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dtparse  # pip install python-dateutil
 
 app = Flask(__name__)
+
+# --- Logging setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 OCM_API_BASE = os.getenv("OCM_API_BASE", "https://oncallmanager.ibm.com")
@@ -35,7 +42,7 @@ def get_team_credentials(team_info):
     username = os.getenv(f"{env_prefix}_OCM_USERNAME")
     password = os.getenv(f"{env_prefix}_OCM_PASSWORD")
     if not username or not password:
-        print(f"[ERROR] Missing credentials for env_prefix={env_prefix}")
+        logger.error(f"Missing credentials for env_prefix={env_prefix}")
         return None, None, None
     subscription_id = username.split("/")[0]
     return username, password, subscription_id
@@ -45,7 +52,7 @@ def fetch_window(subscription_id, start_str, end_str, username, password, group_
     """Fetch a wide time window of schedules."""
     url = f"{OCM_API_BASE}/api/ocdm/v1/{subscription_id}/crosssubscriptionschedules"
     params = {"from": start_str, "to": end_str}
-    print(f"[INFO] GET {url} from={start_str} to={end_str} (group_hint={group_hint})")
+    logger.info(f"GET {url} from={start_str} to={end_str} (group_hint={group_hint})")
 
     try:
         resp = requests.get(url, auth=(username, password), params=params, timeout=30)
@@ -54,14 +61,14 @@ def fetch_window(subscription_id, start_str, end_str, username, password, group_
             if not data:
                 return []
             if isinstance(data, list):
-                print(f"[INFO] OCM returned {len(data)} buckets")
+                logger.info(f"OCM returned {len(data)} buckets")
                 return data
             return []
         else:
-            print(f"[WARN] HTTP {resp.status_code}: {resp.text[:150]}")
+            logger.warning(f"HTTP {resp.status_code}: {resp.text[:150]}")
             return []
     except Exception as e:
-        print(f"[ERROR] fetch_window failed: {e}")
+        logger.error(f"fetch_window failed: {e}")
         return []
 
 
@@ -96,7 +103,7 @@ def overlaps_day(start_iso, end_iso, day_start_utc, day_end_utc):
         end = dtparse.isoparse(end_iso)
         return (start < day_end_utc) and (end > day_start_utc)
     except Exception as e:
-        print(f"[WARN] Failed to parse times: {e}")
+        logger.warning(f"Failed to parse times: {e}")
         return False
 
 
@@ -115,7 +122,7 @@ def pick_display_users(users):
 
 @app.route("/getSchedule", methods=["POST"])
 def get_schedule():
-    """Main endpoint for fetching on-call schedule (supports multi-group teams)."""
+    """Main endpoint for fetching on-call schedule (supports multi-group teams and flexible date)."""
     data = request.get_json(force=True) or {}
     group = data.get("groupPrefix")
     team_key = data.get("teamKey")
@@ -125,16 +132,25 @@ def get_schedule():
     today_only = request.args.get("todayOnly", "").lower()
     date_str = request.args.get("date")
 
-    if date_str and not re.fullmatch(r"^\d{8}$", date_str):
-        return jsonify({"error": "Invalid date format. Use YYYYMMDD."}), 400
-    if today_only == "true" and date_str:
-        return jsonify({"error": "Provide either 'todayOnly' or 'date', not both."}), 400
-    if today_only == "true" or not date_str:
-        date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
+    # --- Normalize date formats ---
+    if date_str:
+        # Accept YYYY-MM-DD or YYYYMMDD
+        date_str = date_str.replace("-", "")
+        if not re.fullmatch(r"^\d{8}$", date_str):
+            logger.warning(f"Invalid date format received: {date_str}")
+            return jsonify({"error": "Invalid date format. Use YYYYMMDD or YYYY-MM-DD."}), 400
+    else:
+        # Default to today
+        if today_only == "true":
+            date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
+        else:
+            date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
 
+    # --- Convert date string to datetime ---
     try:
         target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
     except ValueError:
+        logger.warning(f"Invalid date value received: {date_str}")
         return jsonify({"error": "Invalid date value."}), 400
 
     from datetime import timezone
@@ -144,7 +160,7 @@ def get_schedule():
     query_start = (day_start - datetime.timedelta(days=30)).strftime("%Y%m%d")
     query_end = (day_end + datetime.timedelta(days=30)).strftime("%Y%m%d")
 
-    # 🔹 Resolve the team from config
+    # --- Resolve the team from config ---
     team_name, team_info = find_team_entry(group=group, team_key=team_key, env_prefix=env_prefix)
     if not team_info:
         return jsonify({
@@ -157,17 +173,18 @@ def get_schedule():
     if not username or not password:
         return jsonify({"error": "Missing credentials"}), 500
 
-    # 🔹 Determine which groups to query
+    # --- Determine groups to query ---
     groups_to_query = []
     if group:
         groups_to_query = [group]
     else:
         groups_to_query = team_info.get("groups", [])
 
-    print(f"[INFO] Fetching schedules for groups={groups_to_query}")
+    logger.info(f"Fetching schedules for {groups_to_query} on {date_str}")
 
     results = []
-    with ThreadPoolExecutor(max_workers=len(groups_to_query)) as executor:
+    # --- Performance tweak: cap thread count ---
+    with ThreadPoolExecutor(max_workers=min(len(groups_to_query), 5)) as executor:
         futures = {
             executor.submit(fetch_window, subscription_id, query_start, query_end, username, password, grp): grp
             for grp in groups_to_query
@@ -189,9 +206,10 @@ def get_schedule():
                     })
 
     if not results:
+        logger.info(f"No results found for {groups_to_query} on {date_str}")
         return jsonify({"message": f"No on-call assignments found for {groups_to_query} on {date_str}"}), 404
 
-    # 🔹 Build summary for Watson Assistant
+    # --- Build summary for Watson Assistant ---
     summary_lines = []
     for entry in results:
         try:
@@ -200,10 +218,11 @@ def get_schedule():
             end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
             summary_lines.append(f"{entry['GroupId']}: {user} — {start} → {end}")
         except Exception as e:
-            print(f"[WARN] format fail: {e}")
+            logger.warning(f"Summary formatting failed: {e}")
 
-    summary_text = "Here’s who’s on call today:\n\n" + "\n".join(summary_lines)
+    summary_text = f"Here’s who’s on call for {date_str}:\n\n" + "\n".join(summary_lines)
 
+    logger.info(f"Returning {len(results)} records for {groups_to_query}")
     return jsonify({
         "status": 200,
         "body": results,
@@ -222,6 +241,6 @@ def home():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    print(f"🚀 Starting OCM API backend on port {port}")
+    logger.info(f"🚀 Starting OCM API backend on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
 
