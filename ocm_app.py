@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify
-import datetime, re, os, requests, json, logging, time, hmac, hashlib
+import datetime, re, os, requests, json, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dtparse
 from slack_sdk import WebClient
@@ -16,7 +16,6 @@ OCM_API_BASE = os.getenv("OCM_API_BASE", "https://oncallmanager.ibm.com")
 TEAMS_CONFIG_PATH = "config/teams.json"
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
-SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
 DEFAULT_TEAMKEY = os.getenv("DEFAULT_TEAMKEY", "").strip()
 DEFAULT_GROUP_PREFIX = os.getenv("DEFAULT_GROUP_PREFIX", "").strip()
 
@@ -174,91 +173,28 @@ def get_schedule():
     return jsonify({"status": 200, "body": results, "summary": summary_text}), 200
 
 
-# ---------------------- SLACK SIGNATURE CHECK ----------------------
-def verify_slack_signature(req) -> bool:
-    if not SLACK_SIGNING_SECRET:
-        logger.warning("Missing Slack signing secret; rejecting request.")
-        return False
-    ts = req.headers.get("X-Slack-Request-Timestamp", "0")
-    sig = req.headers.get("X-Slack-Signature", "")
-    try:
-        ts_i = int(ts)
-    except ValueError:
-        return False
-    # reject if older than 5 min
-    if abs(time.time() - ts_i) > 60 * 5:
-        return False
-    body = req.get_data(as_text=True)
-    base = f"v0:{ts}:{body}".encode("utf-8")
-    my_sig = "v0=" + hmac.new(SLACK_SIGNING_SECRET.encode("utf-8"), base, hashlib.sha256).hexdigest()
-    valid = hmac.compare_digest(my_sig, sig)
-    if not valid:
-        logger.warning("Invalid Slack signature.")
-    return valid
-
-
-# ---------------------- SLACK EVENT HANDLER ----------------------
+# ---------------------- SLACK EVENTS (LOCAL TEST MODE) ----------------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    if not verify_slack_signature(request):
-        return "invalid signature", 401
-
-    logger.info("Incoming /slack/events payload:")
+    # Local test mode — no signature verification
+    logger.warning("⚠️  Signature verification disabled for local testing.")
     try:
-        logger.info(json.dumps(request.get_json(force=True), indent=2))
+        data = request.get_json(force=True)
+        logger.info("Incoming /slack/events payload:")
+        logger.info(json.dumps(data, indent=2))
     except Exception as e:
-        logger.warning(f"Could not decode JSON: {e}")
+        logger.warning(f"Failed to parse payload: {e}")
+        return "", 400
 
-    data = request.get_json(force=True) or {}
-    if data.get("type") == "url_verification":
-        return jsonify({"challenge": data.get("challenge")})
-
-    if data.get("type") != "event_callback":
-        return "", 200
-
+    # Minimal behavior simulation
     event = data.get("event", {}) or {}
-    if event.get("subtype") in ("message_changed", "bot_message"):
-        return "", 200
-    if event.get("bot_id"):
-        return "", 200
-
-    channel = event.get("channel")
     text = event.get("text", "")
-    root_ts = event.get("ts")
-    thread_ts = event.get("thread_ts") or root_ts
-    channel_type = event.get("channel_type")
+    channel = event.get("channel")
+    ts_to_use = event.get("thread_ts") or event.get("ts")
 
-    if channel_type == "im":
-        logger.info("Ignoring DM event (channel_type=im)")
-        return "", 200
+    summary = f"(Simulated) Received Slack event for channel={channel}, thread_ts={ts_to_use}, text='{text}'"
 
-    if "on call" not in text.lower():
-        logger.info("Message not relevant to bot")
-        return "", 200
-
-    date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
-    payload = {}
-    if DEFAULT_GROUP_PREFIX:
-        payload["groupPrefix"] = DEFAULT_GROUP_PREFIX
-    if DEFAULT_TEAMKEY:
-        payload["teamKey"] = DEFAULT_TEAMKEY
-
-    logger.info(f"Fetching schedule for {date_str}")
-    try:
-        r = requests.post(request.url_root.rstrip("/") + "/getSchedule",
-                          params={"date": date_str}, json=payload, timeout=30)
-        summary = r.json().get("summary", "No summary returned.")
-    except Exception as e:
-        summary = f"Failed to get schedule: {e}"
-
-    if slack:
-        try:
-            slack.chat_postMessage(channel=channel, text=summary, thread_ts=thread_ts)
-        except SlackApiError as e:
-            logger.error(f"Slack post failed: {e.response.get('error')}")
-    else:
-        logger.info(f"Slack message (simulated): {summary}")
-
+    logger.info(summary)
     return "", 200
 
 
@@ -266,7 +202,7 @@ def slack_events():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "OCM On-Call API (Slack integrated)",
+        "service": "OCM On-Call API (Slack integrated, local test mode)",
         "status": "running",
         "endpoints": ["/getSchedule (POST)", "/slack/events (POST)"]
     }), 200
@@ -276,5 +212,5 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     logger.info(f"🚀 Starting OCM API backend on port {port}")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port, debug=True)
 
