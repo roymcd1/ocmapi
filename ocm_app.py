@@ -16,6 +16,7 @@ OCM_API_BASE = os.getenv("OCM_API_BASE", "https://oncallmanager.ibm.com")
 TEAMS_CONFIG_PATH = "config/teams.json"
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
+SLACK_BOT_USER_ID = os.getenv("SLACK_BOT_USER_ID", "").strip()
 DEFAULT_TEAMKEY = os.getenv("DEFAULT_TEAMKEY", "").strip()
 DEFAULT_GROUP_PREFIX = os.getenv("DEFAULT_GROUP_PREFIX", "").strip()
 
@@ -169,7 +170,7 @@ def get_schedule():
 # ---------------------- SLACK EVENTS ----------------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    logger.warning("⚠️  Signature verification disabled for local testing.")
+    logger.info("📥 Slack event received")
 
     try:
         data = request.get_json(force=True)
@@ -178,32 +179,45 @@ def slack_events():
         logger.error(f"JSON parse error: {e}")
         return "", 400
 
-    # Slack challenge
     if "challenge" in data:
         return jsonify({"challenge": data["challenge"]})
 
     event = data.get("event", {}) or {}
 
-    # Avoid loops
     if event.get("subtype") == "bot_message":
         return "", 200
 
-    text = event.get("text", "")
+    text = event.get("text", "") or ""
     channel = event.get("channel")
     ts_to_use = event.get("thread_ts") or event.get("ts")
 
-    logger.info(f"Replying in thread: channel={channel}, ts={ts_to_use}, text='{text}'")
+    # ✅ Detect bot mention or "on call"
+    mentioned = f"<@{SLACK_BOT_USER_ID}>" in text
+    asked_oncall = "on call" in text.lower()
+
+    if not (mentioned or asked_oncall):
+        return "", 200
+
+    logger.info(f"🤖 Bot invoked in channel={channel}, thread={ts_to_use}, text='{text}'")
+
+    # ✅ Call schedule locally
+    try:
+        resp = requests.post("http://localhost:8080/getSchedule", json={}, timeout=10)
+        data = resp.json()
+        summary = data.get("summary", "No schedule returned.")
+    except Exception as e:
+        logger.error(f"Error contacting /getSchedule: {e}")
+        summary = "⚠️ Error fetching schedule"
 
     # ✅ Reply in thread
-    if slack and channel and ts_to_use:
-        try:
-            slack.chat_postMessage(
-                channel=channel,
-                thread_ts=ts_to_use,
-                text=f"👋 I hear you! You wrote:\n> {text}"
-            )
-        except SlackApiError as e:
-            logger.error(f"Slack error: {e.response['error']}")
+    try:
+        slack.chat_postMessage(
+            channel=channel,
+            thread_ts=ts_to_use,
+            text=summary
+        )
+    except SlackApiError as e:
+        logger.error(f"Slack error: {e.response['error']}")
 
     return "", 200
 
@@ -211,7 +225,7 @@ def slack_events():
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
-        "service": "OCM On-Call API (Slack integrated, local test mode)",
+        "service": "OCM On-Call API (Slack integrated)",
         "status": "running",
         "endpoints": ["/getSchedule (POST)", "/slack/events (POST)"]
     }), 200
