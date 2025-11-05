@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+ifrom flask import Flask, request, jsonify
 import datetime, re, os, requests, json, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dtparse
@@ -38,7 +38,6 @@ def find_team_entry(group=None, team_key=None, env_prefix=None):
                 return name, info
     return None, None
 
-
 def get_team_credentials(team_info):
     env_prefix = team_info["env_prefix"]
     username = os.getenv(f"{env_prefix}_OCM_USERNAME")
@@ -48,7 +47,6 @@ def get_team_credentials(team_info):
         return None, None, None
     subscription_id = username.split("/")[0]
     return username, password, subscription_id
-
 
 def fetch_window(subscription_id, start_str, end_str, username, password, group_hint=None):
     url = f"{OCM_API_BASE}/api/ocdm/v1/{subscription_id}/crosssubscriptionschedules"
@@ -65,7 +63,6 @@ def fetch_window(subscription_id, start_str, end_str, username, password, group_
     except Exception as e:
         logger.error(f"fetch_window failed: {e}")
         return []
-
 
 def normalize_entries(raw_payload):
     out = []
@@ -85,7 +82,6 @@ def normalize_entries(raw_payload):
                 })
     return out
 
-
 def overlaps_day(start_iso, end_iso, day_start_utc, day_end_utc):
     try:
         start = dtparse.isoparse(start_iso)
@@ -94,7 +90,6 @@ def overlaps_day(start_iso, end_iso, day_start_utc, day_end_utc):
     except Exception as e:
         logger.warning(f"Failed to parse times: {e}")
         return False
-
 
 def pick_display_users(users):
     out = []
@@ -106,7 +101,6 @@ def pick_display_users(users):
             "mobile": u.get("MobileNumber") or ""
         })
     return out
-
 
 # ---------------------- GET SCHEDULE ----------------------
 @app.route("/getSchedule", methods=["POST"])
@@ -172,31 +166,46 @@ def get_schedule():
     summary_text = f"Here’s who’s on call for {date_str}:\n\n" + "\n".join(summary_lines)
     return jsonify({"status": 200, "body": results, "summary": summary_text}), 200
 
-
-# ---------------------- SLACK EVENTS (LOCAL TEST MODE) ----------------------
+# ---------------------- SLACK EVENTS ----------------------
 @app.route("/slack/events", methods=["POST"])
 def slack_events():
-    # Local test mode — no signature verification
     logger.warning("⚠️  Signature verification disabled for local testing.")
+
     try:
         data = request.get_json(force=True)
-        logger.info("Incoming /slack/events payload:")
         logger.info(json.dumps(data, indent=2))
     except Exception as e:
-        logger.warning(f"Failed to parse payload: {e}")
+        logger.error(f"JSON parse error: {e}")
         return "", 400
 
-    # Minimal behavior simulation
+    # Slack challenge
+    if "challenge" in data:
+        return jsonify({"challenge": data["challenge"]})
+
     event = data.get("event", {}) or {}
+
+    # Avoid loops
+    if event.get("subtype") == "bot_message":
+        return "", 200
+
     text = event.get("text", "")
     channel = event.get("channel")
     ts_to_use = event.get("thread_ts") or event.get("ts")
 
-    summary = f"(Simulated) Received Slack event for channel={channel}, thread_ts={ts_to_use}, text='{text}'"
+    logger.info(f"Replying in thread: channel={channel}, ts={ts_to_use}, text='{text}'")
 
-    logger.info(summary)
+    # ✅ Reply in thread
+    if slack and channel and ts_to_use:
+        try:
+            slack.chat_postMessage(
+                channel=channel,
+                thread_ts=ts_to_use,
+                text=f"👋 I hear you! You wrote:\n> {text}"
+            )
+        except SlackApiError as e:
+            logger.error(f"Slack error: {e.response['error']}")
+
     return "", 200
-
 
 # ---------------------- HEALTH ----------------------
 @app.route("/", methods=["GET"])
@@ -206,7 +215,6 @@ def home():
         "status": "running",
         "endpoints": ["/getSchedule (POST)", "/slack/events (POST)"]
     }), 200
-
 
 # ---------------------- MAIN ----------------------
 if __name__ == "__main__":
