@@ -210,7 +210,6 @@ def get_schedule():
     if not results:
         return jsonify({"message": f"No on-call assignments found for {groups_to_query} on {date_str}"}), 404
 
-    # --- Build clean summary for Watson Assistant ---
     summary_lines = []
     for entry in results:
         try:
@@ -227,79 +226,76 @@ def get_schedule():
 
 @app.route("/getNextOnCall", methods=["POST"])
 def get_next_on_call():
-    """Find the next time a user (email) is on call."""
+    """Find the next time a user (email) is on call across all configured teams."""
     data = request.get_json(force=True) or {}
     user_id = data.get("userId")
     if not user_id:
         return jsonify({"error": "Missing userId (email address)"}), 400
 
-    group = data.get("groupPrefix")
-    team_key = data.get("teamKey")
-    env_prefix = data.get("envPrefix")
     days_ahead = int(request.args.get("daysAhead", 30))
     limit = int(request.args.get("limit", 1))
-
-    # --- Resolve team ---
-    team_name, team_info = find_team_entry(group=group, team_key=team_key, env_prefix=env_prefix)
-    if not team_info:
-        return jsonify({"error": "No team configuration matched your request."}), 500
-
-    username, password, subscription_id = get_team_credentials(team_info)
-    if not username or not password:
-        return jsonify({"error": "Missing credentials"}), 500
-
-    # --- Build date range ---
     today = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
     start_str = today.strftime("%Y%m%d")
     end_str = (today + datetime.timedelta(days=days_ahead)).strftime("%Y%m%d")
 
-    groups_to_query = team_info.get("groups", [])
-    results = []
+    all_results = []
 
-    with ThreadPoolExecutor(max_workers=min(len(groups_to_query), 5)) as executor:
-        futures = {
-            executor.submit(fetch_window, subscription_id, start_str, end_str, username, password, grp): grp
-            for grp in groups_to_query
-        }
+    # Loop through all configured teams
+    for team_name, team_info in TEAMS.items():
+        username, password, subscription_id = get_team_credentials(team_info)
+        if not username or not password:
+            continue
 
-        for future in as_completed(futures):
-            grp = futures[future]
-            raw = future.result()
-            flat = normalize_entries(raw)
+        groups_to_query = team_info.get("groups", [])
+        with ThreadPoolExecutor(max_workers=min(len(groups_to_query), 5)) as executor:
+            futures = {
+                executor.submit(fetch_window, subscription_id, start_str, end_str, username, password, grp): grp
+                for grp in groups_to_query
+            }
 
-            for row in flat:
-                for user in row.get("Users", []):
-                    if user_id.lower() == (user.get("UserId") or "").lower():
-                        results.append({
-                            "GroupId": row["GroupId"],
-                            "Date": row["Date"],
-                            "StartTime": row.get("StartTime"),
-                            "EndTime": row.get("EndTime"),
-                            "Timezone": row.get("Timezone")
-                        })
+            for future in as_completed(futures):
+                grp = futures[future]
+                raw = future.result()
+                flat = normalize_entries(raw)
 
-    if not results:
+                for row in flat:
+                    for user in row.get("Users", []):
+                        if user_id.lower() == (user.get("UserId") or "").lower():
+                            all_results.append({
+                                "Team": team_name,
+                                "GroupId": row["GroupId"],
+                                "Date": row["Date"],
+                                "StartTime": row.get("StartTime"),
+                                "EndTime": row.get("EndTime"),
+                                "Timezone": row.get("Timezone")
+                            })
+
+    # Remove duplicates
+    unique_results = {
+        (r["GroupId"], r["StartTime"], r["EndTime"]): r for r in all_results
+    }.values()
+
+    if not unique_results:
         return jsonify({
             "message": f"No upcoming on-call assignments found for {user_id} in the next {days_ahead} days."
         }), 404
 
-    # Sort by date/time ascending
-    results.sort(key=lambda x: x.get("StartTime", ""))
-    next_shifts = results[:limit]
+    sorted_results = sorted(unique_results, key=lambda x: x.get("StartTime", ""))
+    next_shifts = sorted_results[:limit]
 
-    # --- Build summary ---
     entry = next_shifts[0]
     start = entry["StartTime"][11:16] if entry.get("StartTime") else "?"
     end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
+
     summary_text = (
-        f"{user_id} is next on call on {entry['Date']} "
-        f"for {entry['GroupId']} ({start} - {end})"
+        f"{user_id} is next on call for {entry['GroupId']} "
+        f"on {entry['Date']} ({start} - {end})"
     )
 
     return jsonify({
         "status": 200,
         "user": user_id,
-        "nextOnCall": next_shifts,
+        "nextOnCall": list(next_shifts),
         "summary": summary_text
     }), 200
 
