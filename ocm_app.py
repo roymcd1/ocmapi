@@ -1,10 +1,5 @@
 from flask import Flask, request, jsonify
-import datetime
-import re
-import os
-import requests
-import json
-import logging
+import datetime, re, os, requests, json, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dtparse  # pip install python-dateutil
 
@@ -33,15 +28,12 @@ def find_team_entry(group=None, team_key=None, env_prefix=None):
         for name, info in TEAMS.items():
             if group in info.get("groups", []):
                 return name, info
-
     if team_key and team_key in TEAMS:
         return team_key, TEAMS[team_key]
-
     if env_prefix:
         for name, info in TEAMS.items():
             if info.get("env_prefix") == env_prefix:
                 return name, info
-
     return None, None
 
 
@@ -50,11 +42,9 @@ def get_team_credentials(team_info):
     env_prefix = team_info["env_prefix"]
     username = os.getenv(f"{env_prefix}_OCM_USERNAME")
     password = os.getenv(f"{env_prefix}_OCM_PASSWORD")
-
     if not username or not password:
         logger.error(f"Missing credentials for env_prefix={env_prefix}")
         return None, None, None
-
     subscription_id = username.split("/")[0]
     return username, password, subscription_id
 
@@ -88,16 +78,13 @@ def normalize_entries(raw_payload):
     out = []
     if not isinstance(raw_payload, list):
         return out
-
     for bucket in raw_payload:
         bucket_group = bucket.get("group") or bucket.get("GroupId")
         details = bucket.get("schedulingDetails", [])
-
         for det in details:
             group_id = det.get("GroupId") or bucket_group
             date = det.get("Date")
             tz = det.get("Timezone")
-
             for shift in det.get("Shifts", []):
                 out.append({
                     "GroupId": group_id,
@@ -134,17 +121,16 @@ def pick_display_users(users):
     return out
 
 
-# --- Routes ---
+# --- ROUTES ---
 @app.route("/getSchedule", methods=["POST"])
 def get_schedule():
-    """Fetch on-call schedule for a specific date."""
+    """Fetch on-call schedule (supports multi-group teams and date)."""
     data = request.get_json(force=True) or {}
-
     group = data.get("groupPrefix")
     team_key = data.get("teamKey")
     env_prefix = data.get("envPrefix")
-    date_str = request.args.get("date")
 
+    date_str = request.args.get("date")
     if date_str:
         date_str = date_str.replace("-", "")
         if not re.fullmatch(r"^\d{8}$", date_str):
@@ -152,28 +138,17 @@ def get_schedule():
     else:
         date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
 
-    try:
-        target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
-    except ValueError:
-        return jsonify({"error": "Invalid date value."}), 400
-
+    target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
     from datetime import timezone
     day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
     day_end = day_start + datetime.timedelta(days=1)
+
     query_start = (day_start - datetime.timedelta(days=30)).strftime("%Y%m%d")
     query_end = (day_end + datetime.timedelta(days=30)).strftime("%Y%m%d")
 
     team_name, team_info = find_team_entry(group=group, team_key=team_key, env_prefix=env_prefix)
     if not team_info:
-        return jsonify({
-            "error": "No team configuration matched your request.",
-            "hint": {
-                "groupPrefix": group,
-                "teamKey": team_key,
-                "envPrefix": env_prefix,
-                "valid_teams": list(TEAMS.keys())
-            }
-        }), 500
+        return jsonify({"error": "No team configuration matched your request."}), 500
 
     username, password, subscription_id = get_team_credentials(team_info)
     if not username or not password:
@@ -187,17 +162,13 @@ def get_schedule():
             executor.submit(fetch_window, subscription_id, query_start, query_end, username, password, grp): grp
             for grp in groups_to_query
         }
-
         for future in as_completed(futures):
             grp = futures[future]
             raw = future.result()
             flat = normalize_entries(raw)
-
             for row in flat:
-                if (
-                    row.get("GroupId") == grp and
-                    overlaps_day(row.get("StartTime", ""), row.get("EndTime", ""), day_start, day_end)
-                ):
+                if (row.get("GroupId") == grp and
+                    overlaps_day(row.get("StartTime",""), row.get("EndTime",""), day_start, day_end)):
                     results.append({
                         "GroupId": row["GroupId"],
                         "Date": date_str,
@@ -212,91 +183,69 @@ def get_schedule():
 
     summary_lines = []
     for entry in results:
-        try:
-            user = entry["Users"][0]["name"] if entry["Users"] else "Unknown"
-            start = entry["StartTime"][11:16] if entry.get("StartTime") else "?"
-            end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
-            summary_lines.append(f"- {entry['GroupId']}: {user} ({start} - {end})")
-        except Exception as e:
-            logger.warning(f"Summary formatting failed: {e}")
+        user = entry["Users"][0]["name"] if entry["Users"] else "Unknown"
+        start = entry["StartTime"][11:16] if entry.get("StartTime") else "?"
+        end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
+        summary_lines.append(f"{entry['GroupId']}: {user} — {start} → {end}")
 
-    summary_text = f"On-call schedule for {date_str}:\n" + "\n".join(summary_lines)
-    return jsonify({"status": 200, "body": results, "summary": summary_text}), 200
+    summary_text = f"Here’s who’s on call for {date_str}:\n\n" + "\n".join(summary_lines)
+
+    return jsonify({
+        "status": 200,
+        "body": results,
+        "summary": summary_text
+    }), 200
 
 
-@app.route("/getNextOnCall", methods=["POST"])
-def get_next_on_call():
-    """Find the next time a user (email) is on call across all configured teams."""
+@app.route("/findNextOnCall", methods=["POST"])
+def find_next_on_call():
+    """Find the next on-call shift for a given email across all teams."""
     data = request.get_json(force=True) or {}
-    user_id = data.get("userId")
-    if not user_id:
-        return jsonify({"error": "Missing userId (email address)"}), 400
+    email = (data.get("email") or "").lower().strip()
+    if not email:
+        return jsonify({"error": "Missing 'email' field"}), 400
 
-    days_ahead = int(request.args.get("daysAhead", 30))
-    limit = int(request.args.get("limit", 1))
-    today = datetime.datetime.utcnow().replace(tzinfo=datetime.timezone.utc)
-    start_str = today.strftime("%Y%m%d")
-    end_str = (today + datetime.timedelta(days=days_ahead)).strftime("%Y%m%d")
+    from datetime import timezone
+    now = datetime.datetime.now(timezone.utc)  # ✅ timezone-aware UTC
+    end_range = now + datetime.timedelta(days=45)
+    query_start = now.strftime("%Y%m%d")
+    query_end = end_range.strftime("%Y%m%d")
 
-    all_results = []
+    found_shift = None
 
-    # Loop through all configured teams
     for team_name, team_info in TEAMS.items():
         username, password, subscription_id = get_team_credentials(team_info)
         if not username or not password:
             continue
+        for group in team_info.get("groups", []):
+            data = fetch_window(subscription_id, query_start, query_end, username, password, group)
+            flat = normalize_entries(data)
+            for row in flat:
+                for u in row.get("Users", []):
+                    uid = u.get("UserId", "").lower()
+                    if email == uid:
+                        start_time = dtparse.isoparse(row["StartTime"])
+                        if start_time > now:  # ✅ both are aware now
+                            if not found_shift or start_time < found_shift["StartTime"]:
+                                found_shift = {
+                                    "Team": team_name,
+                                    "GroupId": row["GroupId"],
+                                    "StartTime": start_time,
+                                    "EndTime": dtparse.isoparse(row["EndTime"]),
+                                    "Timezone": row.get("Timezone"),
+                                    "User": u.get("FullName") or u.get("UserId")
+                                }
 
-        groups_to_query = team_info.get("groups", [])
-        with ThreadPoolExecutor(max_workers=min(len(groups_to_query), 5)) as executor:
-            futures = {
-                executor.submit(fetch_window, subscription_id, start_str, end_str, username, password, grp): grp
-                for grp in groups_to_query
-            }
+    if not found_shift:
+        return jsonify({"message": f"No upcoming shifts found for {email}"}), 404
 
-            for future in as_completed(futures):
-                grp = futures[future]
-                raw = future.result()
-                flat = normalize_entries(raw)
-
-                for row in flat:
-                    for user in row.get("Users", []):
-                        if user_id.lower() == (user.get("UserId") or "").lower():
-                            all_results.append({
-                                "Team": team_name,
-                                "GroupId": row["GroupId"],
-                                "Date": row["Date"],
-                                "StartTime": row.get("StartTime"),
-                                "EndTime": row.get("EndTime"),
-                                "Timezone": row.get("Timezone")
-                            })
-
-    # Remove duplicates
-    unique_results = {
-        (r["GroupId"], r["StartTime"], r["EndTime"]): r for r in all_results
-    }.values()
-
-    if not unique_results:
-        return jsonify({
-            "message": f"No upcoming on-call assignments found for {user_id} in the next {days_ahead} days."
-        }), 404
-
-    sorted_results = sorted(unique_results, key=lambda x: x.get("StartTime", ""))
-    next_shifts = sorted_results[:limit]
-
-    entry = next_shifts[0]
-    start = entry["StartTime"][11:16] if entry.get("StartTime") else "?"
-    end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
-
-    summary_text = (
-        f"{user_id} is next on call for {entry['GroupId']} "
-        f"on {entry['Date']} ({start} - {end})"
-    )
+    fmt_time = found_shift["StartTime"].strftime("%a, %b %d, %H:%M %Z")
+    summary = f"{found_shift['User']} is next on call for {found_shift['Team']} on {fmt_time}"
 
     return jsonify({
         "status": 200,
-        "user": user_id,
-        "nextOnCall": list(next_shifts),
-        "summary": summary_text
+        "body": found_shift,
+        "summary": summary
     }), 200
 
 
@@ -305,12 +254,15 @@ def home():
     return jsonify({
         "service": "OCM On-Call API",
         "status": "running",
-        "endpoints": ["/getSchedule (POST)", "/getNextOnCall (POST)"]
+        "endpoints": [
+            "/getSchedule (POST)",
+            "/findNextOnCall (POST)"
+        ]
     }), 200
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
-    logger.info(f"Starting OCM API backend on port {port}")
+    logger.info(f"🚀 Starting OCM API backend on port {port}")
     app.run(host="0.0.0.0", port=port, debug=False)
 
