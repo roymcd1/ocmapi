@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify
 import datetime, re, os, requests, json, logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dateutil import parser as dtparse  # pip install python-dateutil
+from zoneinfo import ZoneInfo
 
 app = Flask(__name__)
 
@@ -138,6 +139,7 @@ def get_schedule():
     else:
         date_str = datetime.datetime.utcnow().strftime("%Y%m%d")
 
+
     target_date = datetime.datetime.strptime(date_str, "%Y%m%d")
     from datetime import timezone
     day_start = target_date.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
@@ -181,14 +183,26 @@ def get_schedule():
     if not results:
         return jsonify({"message": f"No on-call assignments found for {groups_to_query} on {date_str}"}), 404
 
+    # --- NEW: Summary with UTC + ET ---
     summary_lines = []
     for entry in results:
         user = entry["Users"][0]["name"] if entry["Users"] else "Unknown"
-        start = entry["StartTime"][11:16] if entry.get("StartTime") else "?"
-        end = entry["EndTime"][11:16] if entry.get("EndTime") else "?"
-        summary_lines.append(f"{entry['GroupId']}: {user} — {start} → {end}")
 
-    summary_text = f"Here’s who’s on call for {date_str}:\n\n" + "\n".join(summary_lines)
+        # Convert ISO timestamps → timezone aware
+        start_utc = dtparse.isoparse(entry["StartTime"]).astimezone(ZoneInfo("UTC"))
+        end_utc = dtparse.isoparse(entry["EndTime"]).astimezone(ZoneInfo("UTC"))
+
+        # Convert to Eastern Time
+        start_et = start_utc.astimezone(ZoneInfo("America/New_York"))
+        end_et = end_utc.astimezone(ZoneInfo("America/New_York"))
+
+        summary_lines.append(
+            f"{entry['GroupId']}: {user}\n"
+            f"   UTC: {start_utc.strftime('%H:%M')} → {end_utc.strftime('%H:%M')}\n"
+            f"   ET:  {start_et.strftime('%H:%M')} → {end_et.strftime('%H:%M')}"
+        )
+
+    summary_text = f"Here’s who’s on call for {date_str}:\n\n" + "\n\n".join(summary_lines)
 
     return jsonify({
         "status": 200,
@@ -206,7 +220,7 @@ def find_next_on_call():
         return jsonify({"error": "Missing 'email' field"}), 400
 
     from datetime import timezone
-    now = datetime.datetime.now(timezone.utc)  # ✅ timezone-aware UTC
+    now = datetime.datetime.now(timezone.utc)  # timezone-aware UTC
     end_range = now + datetime.timedelta(days=45)
     query_start = now.strftime("%Y%m%d")
     query_end = end_range.strftime("%Y%m%d")
@@ -225,7 +239,7 @@ def find_next_on_call():
                     uid = u.get("UserId", "").lower()
                     if email == uid:
                         start_time = dtparse.isoparse(row["StartTime"])
-                        if start_time > now:  # ✅ both are aware now
+                        if start_time > now:
                             if not found_shift or start_time < found_shift["StartTime"]:
                                 found_shift = {
                                     "Team": team_name,
